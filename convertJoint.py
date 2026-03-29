@@ -25,8 +25,9 @@ invert_direction: List[bool] = [
     False,  # C (J6)
 ]
 
-# Initialize last motor positions for relative position tracking
+# Initialize last motor positions and last joint angles for position tracking
 last_motor_positions: List[float] = [0.0] * 6
+last_joint_angles: List[float] = [0.0] * 6
 
 # -------------------
 
@@ -121,14 +122,24 @@ def process_tap_files() -> None:
                         except ValueError:
                             continue
 
-                    if line.startswith("G90"):
+                    if line.startswith("G90") or line.startswith("G91"):
                         values = [
                             float(value) if "." in value else int(value)
                             for value in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", line)
                         ]
 
                         if len(values) >= 7:
-                            joint_angles = [float(v) for v in values[1:7]]
+                            if line.startswith("G91"):
+                                # Relative: add deltas to current joint angles
+                                joint_angles = [
+                                    last_joint_angles[i] + float(values[i + 1])
+                                    for i in range(6)
+                                ]
+                            else:
+                                # Absolute
+                                joint_angles = [float(v) for v in values[1:7]]
+
+                            last_joint_angles[:] = joint_angles
                             motor_positions = joint_to_motor_positions(joint_angles)
 
                             for axis_id in range(1, 7):

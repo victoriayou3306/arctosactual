@@ -16,8 +16,7 @@ def generate_sweep(
     z_amplitude: float = 5,
 ):
     """
-    Generate a sweep trajectory: X sweeps left-to-right while Y and Z
-    oscillate up and down.
+    Generate a sweep trajectory: X sweeps left-to-right while Y and Z oscillate up and down.
 
     Args:
         filename: Output .tap file path.
