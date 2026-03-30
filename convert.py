@@ -7,13 +7,13 @@ from typing import List
 
 # Gearbox ratios for each motor
 gear_ratios: List[float] = [
-    0.5,
-    0.5,
-    1,
-    1,
-    1,
-    1,
-]  # Replace with your actual gearbox ratios
+    13.5,    # X (J1) - Belt reduction
+    150,     # Y (J2) - Cycloidal
+    150,     # Z (J3) - Cycloidal
+    48,      # A (J4) - Compound Planetary
+    67.82,   # B (J5) - Compound Planetary
+    67.82,   # C (J6) - Compound Planetary
+]
 
 # Direction inversion for each motor (True/False)
 invert_direction: List[bool] = [

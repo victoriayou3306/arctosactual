@@ -15,6 +15,7 @@ gear_ratios: List[float] = [
     67.82,   # C (J6) - Compound Planetary
 ]
 
+
 # Direction inversion for each motor
 invert_direction: List[bool] = [
     True,   # X (J1)
