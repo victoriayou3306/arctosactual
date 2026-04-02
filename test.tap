@@ -1,5 +1,0 @@
-F1000
-G90 X0      Y0      Z0      A0      B0      C0
-G90 X10     Y0     Z0     A60      B0      C0
-G90 X-20     Y0     Z0     A0      B0      C0
-
