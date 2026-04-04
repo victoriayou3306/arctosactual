@@ -28,6 +28,7 @@ invert_direction: List[bool] = [
 # Initialize zero positions and last positions
 initial_positions: List[int] = [0] * 6
 last_positions: List[float] = [0] * 6
+current_joint_positions: List[float] = [0] * 6
 
 # -------------------
 
@@ -71,8 +72,8 @@ def convert_to_can_message(
     can_id = format(axis_id + 6, "02X")
     speed_hex = format(speed, "04X")
 
-    # Calculate relative position based on the initial position
-    rel_position = int((position * gear_ratio - initial_positions[axis_id - 1]) * 100)
+    # Calculate relative position based on the last position
+    rel_position = int((position * gear_ratio - last_positions[axis_id - 1]) * 100)
 
     # Handle signed 24-bit integer using two's complement representation
     rel_position_hex = format(rel_position & 0xFFFFFF, "06X")
@@ -109,31 +110,42 @@ def process_tap_files() -> None:
                         except ValueError:
                             continue
 
-                    if line.startswith("G90"):
+                    is_g90 = line.startswith("G90")
+                    is_g91 = line.startswith("G91")
+
+                    if is_g90 or is_g91:
                         values = [
                             float(value) if "." in value else int(value)
                             for value in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", line)
                         ]
 
                         if len(values) >= 7:
-                            for axis_id, position in enumerate(values[1:7], start=1):
-                                # Use the corresponding gear ratio for each motor
+                            deltas = list(values[1:7])
+
+                            if is_g90:
+                                axis_positions = deltas
+                            else:  # G91
+                                axis_positions = [
+                                    current_joint_positions[i] + deltas[i]
+                                    for i in range(6)
+                                ]
+
+                            # Update joint-space tracker
+                            for i in range(6):
+                                current_joint_positions[i] = axis_positions[i]
+
+                            for axis_id, position in enumerate(axis_positions, start=1):
                                 gear_ratio = gear_ratios[axis_id - 1]
                                 invert_dir = invert_direction[axis_id - 1]
                                 can_message = convert_to_can_message(
                                     axis_id, speed, position, gear_ratio, invert_dir
                                 )
                                 crc = calculate_crc(
-                                    [
-                                        int(can_message[i : i + 2], 16)
-                                        for i in range(0, len(can_message), 2)
-                                    ]
+                                    [int(can_message[i:i+2], 16) for i in range(0, len(can_message), 2)]
                                 )
                                 can_message_with_crc = can_message + format(crc, "02X")
                                 output_file.write(can_message_with_crc + "\n")
-                                print(
-                                    f"Converted g-code line to CAN message: {can_message_with_crc}"
-                                )
+                                print(f"Converted g-code line to CAN message: {can_message_with_crc}")
 
 
 if __name__ == "__main__":
