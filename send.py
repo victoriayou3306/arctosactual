@@ -178,7 +178,7 @@ def main() -> None:
             chunk_size=6,
             timeout_per_chunk=15.0,
             status_byte_index=1,
-            skip_ids={0xb, 0xc},        # remove once motor 5 hardware is verified
+            skip_ids={0xb},        # remove once motor 5 hardware is verified
         )
 
     bus.shutdown()

@@ -16,14 +16,7 @@ gear_ratios: List[float] = [
 ]
 
 # Direction inversion for each motor (True/False)
-invert_direction: List[bool] = [
-    True,
-    True,
-    False,
-    False,
-    False,
-    False,
-]  # Set True for motors where direction should be inverted
+invert_direction: List[bool] = [True, False, True, False, True, False] # Set True for motors where direction should be inverted
 
 # Initialize zero positions and last positions
 initial_positions: List[int] = [0] * 6
@@ -31,6 +24,23 @@ last_positions: List[float] = [0] * 6
 current_joint_positions: List[float] = [0] * 6
 
 # -------------------
+
+def apply_differential_mix(angles_rad):
+    """
+    Convert logical joint angles [B, C] into motor commands [M5, M6]
+    for a bevel gear differential.
+    Joints 0-3 (J1-J4) pass through unchanged.
+    """
+    mixed = list(angles_rad)  # copy so we don't mutate the original
+
+    b = angles_rad[4]  # joint 5 (B) — 0-indexed
+    c = angles_rad[5]  # joint 6 (C)
+
+    mixed[4] = (b + c) / 2.0   # M5
+    mixed[5] = (-b + c) / 2.0   # M6
+    # rospy.loginfo(f"+-Differential mix: B={math.degrees(b):.2f} C={math.degrees(c):.2f} → M5={math.degrees(mixed[4]):.2f} M6={math.degrees(mixed[5]):.2f}")
+
+    return mixed
 
 
 def calculate_crc(data: List[int]) -> int:
@@ -73,13 +83,16 @@ def convert_to_can_message(
     speed_hex = format(speed, "04X")
 
     # Calculate relative position based on the last position
-    rel_position = int((position * gear_ratio - last_positions[axis_id - 1]) * 100)
+    pos = position
+    if invert_direction:
+        pos *= -1
+    rel_position = int((pos * gear_ratio - last_positions[axis_id - 1]) * 100)
 
     # Handle signed 24-bit integer using two's complement representation
     rel_position_hex = format(rel_position & 0xFFFFFF, "06X")
 
     # Update last_position for the axis
-    last_positions[axis_id - 1] = position * gear_ratio
+    last_positions[axis_id - 1] = pos * gear_ratio
 
     return can_id + "F4" + speed_hex + "02" + rel_position_hex
 
@@ -133,6 +146,8 @@ def process_tap_files() -> None:
                             # Update joint-space tracker
                             for i in range(6):
                                 current_joint_positions[i] = axis_positions[i]
+
+                            axis_positions = apply_differential_mix(axis_positions)
 
                             for axis_id, position in enumerate(axis_positions, start=1):
                                 gear_ratio = gear_ratios[axis_id - 1]
