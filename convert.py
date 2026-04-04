@@ -7,12 +7,12 @@ from typing import List
 
 # Gearbox ratios for each motor
 gear_ratios: List[float] = [
-    13.5,    # X (J1) - Belt reduction
-    150,     # Y (J2) - Cycloidal
-    150,     # Z (J3) - Cycloidal
-    48,      # A (J4) - Compound Planetary
-    67.82,   # B (J5) - Compound Planetary
-    67.82,   # C (J6) - Compound Planetary
+    13.5/2,    # X (J1) - Belt reduction
+    150/2,     # Y (J2) - Cycloidal
+    150/2,     # Z (J3) - Cycloidal
+    48/2,      # A (J4) - Compound Planetary
+    67.82/2,   # B (J5) - Compound Planetary
+    67.82/2,   # C (J6) - Compound Planetary
 ]
 
 # Direction inversion for each motor (True/False)
@@ -68,7 +68,7 @@ def convert_to_can_message(
     Returns:
         A string representing the CAN message.
     """
-    can_id = format(axis_id, "02X")
+    can_id = format(axis_id + 6, "02X")
     speed_hex = format(speed, "04X")
 
     # Calculate relative position based on the initial position
@@ -80,7 +80,7 @@ def convert_to_can_message(
     # Update last_position for the axis
     last_positions[axis_id - 1] = position * gear_ratio
 
-    return can_id + "F5" + speed_hex + "02" + rel_position_hex
+    return can_id + "F4" + speed_hex + "02" + rel_position_hex
 
 
 def process_tap_files() -> None:

@@ -14,12 +14,6 @@ def parse_can_message(line: str) -> can.Message:
 
     Returns:
         A `can.Message` object with the parsed arbitration ID and data bytes.
-
-    Note:
-        The arbitration ID is assumed to be the first two characters of the ID,
-        converted from hexadecimal. The data is assumed to be hexadecimal bytes,
-        where the first part of the data is directly following the ID in the
-        same string, and additional data parts are separated by spaces.
     """
     parts = line.split(" ")
     arbitration_id = int(parts[0][:2], 16)
@@ -45,14 +39,10 @@ def calculate_crc(arbitration_id: int, status: int) -> int:
 
 def adjust_speeds_within_packet(messages: List[can.Message]) -> None:
     """
-    Adjusts the speeds within a packet of CAN messages based on the average speed.
+    Adjusts the speeds within a chunk of CAN messages based on the average speed.
 
     Args:
-        messages: A list of `can.Message` objects, each representing a CAN message.
-
-    Note:
-        This function directly modifies the `data` attribute of each `can.Message`
-        object in the list to adjust the speed values.
+        messages: A list of `can.Message` objects representing a coordinated chunk.
     """
     speeds = [(msg.data[3] << 8) + msg.data[4] for msg in messages]
     reference_speed = sum(speeds) // len(speeds)
@@ -65,73 +55,134 @@ def adjust_speeds_within_packet(messages: List[can.Message]) -> None:
         msg.data[4] = adjusted_speed & 0xFF
 
 
-def can_send_messages(bus: can.interface.Bus, messages: List[can.Message]) -> None:
+def send_chunk_and_wait(
+    bus: can.interface.Bus,
+    chunk: List[can.Message],
+    timeout: float = 5.0,
+    status_byte_index: int = 1,
+    expected_status: int = 0x02,
+    skip_ids: set = None,
+) -> bool:
+    expected_ids = {msg.arbitration_id for msg in chunk}
+    if skip_ids:
+        expected_ids -= skip_ids
+    confirmed_ids: set = set()
+    error_ids: set = set()
+
+    for msg in chunk:
+        bus.send(msg)
+        data_bytes = ", ".join(f"0x{b:02X}" for b in msg.data)
+        print(f"  → Sent:     ID=0x{msg.arbitration_id:02X}  data=[{data_bytes}]")
+
+    print(f"  Waiting for ACK from motors: {[hex(i) for i in sorted(expected_ids)]}")
+    if skip_ids:
+        print(f"  Skipping ACK wait for motors: {[hex(i) for i in sorted(skip_ids)]}")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        received_msg = bus.recv(timeout=min(remaining, 0.1))
+
+        if received_msg is None:
+            continue
+
+        data_bytes = ", ".join(f"0x{b:02X}" for b in received_msg.data)
+        print(f"  ← Received: ID=0x{received_msg.arbitration_id:02X}  data=[{data_bytes}]")
+
+        if received_msg.arbitration_id in expected_ids and len(received_msg.data) > status_byte_index:
+            status = received_msg.data[status_byte_index]
+
+            if status == expected_status:
+                confirmed_ids.add(received_msg.arbitration_id)
+                print(f"    ✓ Motor 0x{received_msg.arbitration_id:02X} confirmed complete.")
+
+            elif status == 0x00:
+                error_ids.add(received_msg.arbitration_id)
+                print(f"    ✗ Motor 0x{received_msg.arbitration_id:02X} returned ERROR (status=0x00) — command rejected.")
+
+        # Treat errored motors as done (failed) so they don't block the timeout
+        if (confirmed_ids | error_ids) == expected_ids:
+            if error_ids:
+                print(f"  ✗ Chunk completed with errors on motors: {[hex(i) for i in sorted(error_ids)]}\n")
+                return False
+            print(f"  ✓ All motors in chunk confirmed. Proceeding.\n")
+            return True
+
+    print(f"  ✗ Timeout! No ACK from: {[hex(i) for i in sorted(expected_ids - confirmed_ids - error_ids)]}\n")
+    return False
+
+
+def send_six_dof_sequence(
+    bus: can.interface.Bus,
+    all_messages: List[can.Message],
+    chunk_size: int = 6,
+    timeout_per_chunk: float = 5.0,
+    status_byte_index: int = 1,
+    skip_ids: set = None,
+) -> None:
     """
-    Sends a list of CAN messages through a specified CAN bus and waits for responses.
+    Sends 6 motor messages in sequential chunks, waiting for full ACK
+    from each chunk before sending the next.
 
     Args:
-        bus: The `can.interface.Bus` instance representing the CAN bus to send messages on.
-        messages: A list of `can.Message` objects to be sent.
-
-    Note:
-        This function waits for responses from expected motors after sending messages
-        and prints out the status of the sent and received messages.
+        bus:               The CAN bus instance.
+        all_messages:      Flat list of 6 can.Message objects (one per motor).
+        chunk_size:        How many motors to command per chunk (default 6).
+        timeout_per_chunk: Seconds to wait for each chunk's ACKs.
+        status_byte_index: Index in response data[] that holds the status byte.
+        skip_ids:          Set of motor arbitration IDs to send but not wait on.
     """
-    expected_responses = {1, 2}
-    received_responses = set()
-    for msg in messages:
-        bus.send(msg)
-        data_bytes = ", ".join([f"0x{byte:02X}" for byte in msg.data])
-        print(
-            f"Sent: arbitration_id=0x{msg.arbitration_id:X}, data=[{data_bytes}], is_extended_id=False"
+    chunks = [all_messages[i : i + chunk_size] for i in range(0, len(all_messages), chunk_size)]
+
+    for idx, chunk in enumerate(chunks):
+        ids = [hex(m.arbitration_id) for m in chunk]
+        print(f"── Chunk {idx + 1}/{len(chunks)}  motors={ids} ──")
+        adjust_speeds_within_packet(chunk)
+        success = send_chunk_and_wait(
+            bus,
+            chunk,
+            timeout=timeout_per_chunk,
+            status_byte_index=status_byte_index,
+            skip_ids=skip_ids,
         )
-    timeout = 0.5
-    start_time = time.time()
-    while True:
-        received_msg = bus.recv(timeout=3)
-        if received_msg is not None:
-            received_data_bytes = ", ".join(
-                [f"0x{byte:02X}" for byte in received_msg.data]
-            )
-            print(
-                f"Received: arbitration_id=0x{received_msg.arbitration_id:X}, data=[{received_data_bytes}], is_extended_id=False"
-            )
-            if received_msg.arbitration_id in expected_responses:
-                received_responses.add(received_msg.arbitration_id)
-        if received_responses == expected_responses:
-            if all(
-                received_msg.data[0] == 2 if received_msg is not None else False
-                for received_msg in [bus.recv(timeout=0.1)] * len(expected_responses)
-            ):
-                print(
-                    "Responses received for all expected motors with status 2. Moving to the next set of messages."
-                )
-                break
-        if time.time() - start_time > timeout:
-            print("Timeout waiting for responses from expected motors with status 2.")
-            break
+        if not success:
+            print(f"Aborting sequence at chunk {idx + 1} due to timeout.")
+            return
+
+    print("All chunks completed successfully.")
 
 
 def main() -> None:
     """
-    Main function to read CAN messages from a .txt file, send them through a CAN bus, and adjust speeds within packets.
+    Main function to read CAN messages from a .txt file, send them through
+    a CAN bus in sequential chunks, and wait for motor ACKs between chunks.
     """
     script_directory = os.path.dirname(os.path.abspath(__file__))
-    txt_files = [file for file in os.listdir(script_directory) if file.endswith(".txt")]
-    if not txt_files:
-        print("No .txt files found in the script directory.")
-        return
-    selected_file = txt_files[0]
-    file_path = os.path.join(script_directory, selected_file)
-    bus = can.interface.Bus(interface="slcan", channel="/dev/tty.usbmodem2095387B58421", bitrate=500000)  # Updated bitrate
+    file_path = os.path.join(script_directory, "test.txt")
+
+    bus = can.interface.Bus(interface="slcan", channel="/dev/ttyACM0", bitrate=500000)
+
     with open(file_path, "r") as file:
-        lines = file.readlines()
-    message_sets = [lines[i : i + 6] for i in range(0, len(lines), 6)]
-    for message_set in message_sets:
-        messages = [parse_can_message(line.strip()) for line in message_set]
-        adjust_speeds_within_packet(messages)
-        can_send_messages(bus, messages)
+        lines = [l.strip() for l in file.readlines() if l.strip()]
+
+    # Each group of 6 lines = one full arm pose
+    pose_sets = [lines[i : i + 6] for i in range(0, len(lines), 6)]
+
+    for pose_idx, pose_lines in enumerate(pose_sets):
+        print(f"\n══════ Pose {pose_idx + 1}/{len(pose_sets)} ══════")
+        messages = [parse_can_message(line) for line in pose_lines]
+
+        send_six_dof_sequence(
+            bus,
+            messages,
+            chunk_size=6,
+            timeout_per_chunk=15.0,
+            status_byte_index=1,
+            skip_ids={0xb, 0xc},        # remove once motor 5 hardware is verified
+        )
+
     bus.shutdown()
+    print("Done.")
 
 
 if __name__ == "__main__":
