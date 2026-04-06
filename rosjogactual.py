@@ -13,46 +13,71 @@ import threading
 CAN_INTERFACE = "socketcan"
 CAN_CHANNEL   = "can0"
 CAN_BITRATE   = 500000
+#CAN_IDS = [1, 2, 3, 4, 5, 6] 
 
 GEAR_RATIOS = [6.75, 75, 75, 24, 33.91, 33.91]
-INVERT_DIRECTION = [True, True, False, False, False, False]
-DEFAULT_SPEED = 800
+INVERT_DIRECTION = [True, False, False, False, False, False]
+DEFAULT_SPEED = 600
 JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+DEFAULT_ACCEL = 2
 
 TAP_FILE = "testing.tap"
 MOVE_DELAY = 2.0  # Adjust based on how far your moves are
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
-current_angles  = [0.0] * 6
 initial_pos     = [0.0] * 6
+current_angles  = initial_pos
 _bus = None
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def calculate_crc(data_bytes):
     return sum(data_bytes) & 0xFF
+    
+def apply_differential_mix(angles_rad):
+    """
+    Convert logical joint angles [B, C] into motor commands [M5, M6]
+    for a bevel gear differential.
+    Joints 0-3 (J1-J4) pass through unchanged.
+    """
+    mixed = list(angles_rad)  # copy so we don't mutate the original
+
+    b = angles_rad[4]  # joint 5 (B) — 0-indexed
+    c = angles_rad[5]  # joint 6 (C)
+
+    mixed[4] = (b + c) / 2.0   # M5
+    mixed[5] = (-b + c) / 2.0   # M6
+    rospy.loginfo(f"+-Differential mix: B={math.degrees(b):.2f} C={math.degrees(c):.2f} → M5={math.degrees(mixed[4]):.2f} M6={math.degrees(mixed[5]):.2f}")
+
+    return mixed
 
 def angle_to_can_message(axis_id, speed, angle_rad, gear_ratio):
     idx = axis_id - 1
+    actual_can_id = axis_id + 6  # joint1=7, joint2=8, joint3=9, etc.
     angle_deg = math.degrees(angle_rad)
     if INVERT_DIRECTION[idx]:
         angle_deg = -angle_deg
-   
-    # G90 Logic: We calculate relative step from where the motor last stopped
-    rel_position = int((angle_deg * gear_ratio - initial_pos[idx]) * 100)
-    initial_pos[idx] = angle_deg * gear_ratio
-   
-    can_id = format(axis_id, '02X')
-    speed_hex = format(speed, '04X')
-    rel_position_hex = format(rel_position & 0xFFFFFF, '06X')
-    return can_id + 'F5' + speed_hex + '02' + rel_position_hex
+    # Calculate relative steps from last position
+    rel_position = int((angle_deg * gear_ratio - current_angles[idx]) * 100)
+    current_angles[idx] = angle_deg * gear_ratio
+    rospy.loginfo(f"Axis {axis_id} (CAN ID {actual_can_id}): angle={round(angle_deg,2)}deg rel_steps={rel_position}")
+    # --- Correct MKS CAN frame format ---
+    # ID | F5 | speed_high | speed_low | acc | pos_high | pos_mid | pos_low | CRC
+    can_id    = format(actual_can_id, '02X')
+    speed_hex = format(speed, '04X')                        # 2 bytes
+    accel_hex = format(DEFAULT_ACCEL, '02X')                # 1 byte
+    pos_hex   = format(rel_position & 0xFFFFFF, '06X')      # 3 bytes (signed 24-bit)
+    return can_id + 'F4' + speed_hex + accel_hex + pos_hex
 
 def send_can_frames(angles_rad):
     global _bus
     if _bus is None: return
+    
+    motor_angles = apply_differential_mix(angles_rad)
+    
     try:
         for axis_id in range(1, 7):
             idx = axis_id - 1
-            hex_msg = angle_to_can_message(axis_id, DEFAULT_SPEED, angles_rad[idx], GEAR_RATIOS[idx])
+            hex_msg = angle_to_can_message(axis_id, DEFAULT_SPEED, motor_angles[idx], GEAR_RATIOS[idx])
             rospy.loginfo(f"Sending axis {axis_id}: {hex_msg}")
             data_bytes = [int(hex_msg[i:i+2], 16) for i in range(0, len(hex_msg), 2)]
             crc = calculate_crc(data_bytes)
@@ -60,6 +85,7 @@ def send_can_frames(angles_rad):
             all_bytes = [int(full_hex[i:i+2], 16) for i in range(0, len(full_hex), 2)]
             msg = can.Message(arbitration_id=all_bytes[0], data=all_bytes[1:], is_extended_id=False)
             _bus.send(msg)
+            rospy.sleep(0.01) 
     except Exception as e:
         rospy.logerr(f"CAN error: {e}")
 

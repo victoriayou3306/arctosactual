@@ -5,7 +5,7 @@ import re
 # -------------------
 
 # Gearbox ratios for each motor
-gear_ratios = [1, 1, 1, 1, 1, 1]  # Replace with your actual gearbox ratios
+gear_ratios = [6.75, 75, 75, 24, 33.91, 33.91]  # Replace with your actual gearbox ratios
 
 # Direction inversion for each motor (True/False)
 invert_direction = [True, True, False, False, False, False]  # Set True for motors where direction should be inverted
@@ -25,7 +25,7 @@ def calculate_crc(data):
 
 
 def convert_to_can_message(axis_id, speed, position, gear_ratio, invert_direction=False):
-    can_id = format(axis_id, '02X')
+    can_id = format(axis_id+6, '02X')
     speed_hex = format(speed, '04X')
 
     # Calculate relative position based on the initial position

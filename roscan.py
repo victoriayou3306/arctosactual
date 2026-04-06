@@ -81,7 +81,7 @@ def calculate_crc(data):
 
 
 def convert_to_can_message(axis_id, speed, position, gear_ratio, invert_direction=False):
-    can_id = format(axis_id, '02X')
+    can_id = format(axis_id+7, '02X')
     speed_hex = format(speed, '04X')
 
     # Calculate relative position based on the initial position

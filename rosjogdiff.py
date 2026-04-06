@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rosjog.py
+rosjogdiff.py
 =========
 Subscribes to /ui_command from the Arctos GUI.
 On "go_to_joint_state" commands:
@@ -29,7 +29,7 @@ CAN_BITRATE = 500000
 GEAR_RATIOS = [6.75, 75, 75, 24, 33.91, 33.91]
 
 # Direction inversion per joint
-INVERT_DIRECTION = [True, True, False, False, False, False]
+INVERT_DIRECTION = [True, False, False, False, True, False]
 
 # Speed for CAN moves (adjust as needed)
 DEFAULT_SPEED = 800
@@ -57,8 +57,8 @@ def apply_differential_mix(angles_rad):
     """
     mixed = list(angles_rad)  # copy so we don't mutate the original
 
-    b = angles_rad[4]  # joint 5 (B) — 0-indexed
-    c = angles_rad[5]  # joint 6 (C)
+    c = angles_rad[4]  # joint 5 (B) — 0-indexed
+    b = angles_rad[5]  # joint 6 (C)
 
     mixed[4] = (b + c) / 2.0   # M5
     mixed[5] = (-b + c) / 2.0   # M6
@@ -87,7 +87,7 @@ def angle_to_can_message(axis_id, speed, angle_rad, gear_ratio):
     # Update tracking
     last_pos[idx] = angle_deg * gear_ratio
 
-    can_id           = format(axis_id + 6, '02X')
+    can_id           = format(axis_id+6, '02X')
     speed_hex        = format(speed, '04X')
     rel_position_hex = format(rel_position & 0xFFFFFF, '06X')
 
