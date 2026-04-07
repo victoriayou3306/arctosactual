@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 """
-roscan2.py — MKS Servo CAN bridge for Arctos arm (F4 relative motion)
+roscanvel.py — MKS Servo CAN bridge for Arctos arm (F4 relative motion)
 ----------------------------------------------------------------------
 Subscribes to /move_group/fake_controller_joint_states and sends
 F4 (relative motion by axis) commands to MKS servo drivers via CAN.
 
-After each settle-and-send cycle, publishes True on /arctos/move_complete
-so that arctos_trajectory.py can synchronize with physical moves.
+Key fix: Instead of rate-limiting or ack-waiting, this version detects
+when the trajectory has SETTLED (stopped changing) and then sends ONE
+F4 command per joint for the entire accumulated delta. This means the
+motor gets a single clean move command rather than being interrupted
+by a stream of tiny incremental commands.
+
+Velocity sync: All joints are velocity-scaled so they finish at the
+same time. The joint requiring the highest motor RPM is capped at
+MAX_RPM (3000 for SR_vFOC), and all others are scaled down by the
+same factor to maintain synchronization. Joints that would fall below
+MIN_RPM are boosted (along with all other joints proportionally) to
+prevent motor stalling at very low speeds.
+
+Move time is latched when new motion is first detected, not when
+commands are sent. This prevents a race condition where the trajectory
+script overwrites /arctos/move_time for the next waypoint before
+roscan has finished processing the current one.
 
 Launch sequence:
   cd ~/catkin_ws/devel && source setup.bash
   roslaunch arctos_config demo.launch
-  python3 ~/arctosgui/roscan2.py
+  python3 ~/arctosgui/roscanvel.py
   rosrun moveo_moveit interface.py
   rosrun moveo_moveit transform.py
   python3 ~/arctosgui/arctos_trajectory.py
@@ -23,7 +38,6 @@ import time
 import can
 import rospy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
@@ -39,8 +53,23 @@ INVERT_DIRECTION = [True, False, True, False, True, False]
 # One full motor revolution = 0x4000 = 16384 counts (command "31").
 ENCODER_CPR = 16384
 
-MOTOR_SPEED = 1000   # RPM
-MOTOR_ACC   = 20     # 0-255
+# SR_vFOC absolute maximum is 3000 RPM. Any value above this gets clamped
+# by the motor firmware, breaking synchronization between joints.
+MAX_RPM = 3000
+
+# Minimum reliable motor RPM. Below this, MKS servos may stall or stutter
+# because the internal PID can't maintain stable rotation. If any joint
+# would fall below this, ALL joints are scaled up proportionally so the
+# slowest joint runs at exactly MIN_RPM. The move completes faster than
+# requested, but stays synchronized.
+MIN_RPM = 50
+
+# Default move time in seconds. All joints are velocity-scaled so that the
+# joint requiring the highest motor RPM finishes in this time (or slower if
+# it would exceed MAX_RPM). Override live via: rosparam set /arctos/move_time <sec>
+DEFAULT_MOVE_TIME = 7.0
+
+MOTOR_ACC = 130  # 0-255
 
 # How long (seconds) with no new joint state before we consider the
 # trajectory settled and send the accumulated delta as one command.
@@ -52,7 +81,6 @@ MIN_DELTA_RAD = 0.01
 # ── STATE ─────────────────────────────────────────────────────────────────────
 
 bus = None
-move_complete_pub = None
 
 # The joint angles we last actually sent to the motors
 last_sent_angles = [0.0] * 6
@@ -83,10 +111,76 @@ def apply_differential_mix(angles_rad):
     return mixed
 
 
-def send_f4(joint_idx, delta_rad):
+def compute_joint_velocities(deltas_rad, move_time):
+    """
+    Compute per-joint motor RPM so all joints finish in the same time.
+
+    For each joint, the required motor RPM to finish in move_time seconds:
+        motor_revs = |delta_deg| / 360 * gear_ratio
+        rpm = motor_revs / (move_time / 60)
+
+    Then two corrections are applied in order:
+      1. If any joint exceeds MAX_RPM, scale ALL joints down so the
+         bottleneck runs at exactly MAX_RPM.
+      2. If any active joint falls below MIN_RPM, scale ALL joints up
+         so the slowest joint runs at exactly MIN_RPM.
+
+    Both corrections preserve the ratio between joints, so they all
+    still finish at the same time.
+
+    Returns a list of 6 integer RPM values (0 for joints below MIN_DELTA_RAD).
+    """
+    # Step 1: compute raw RPMs from move_time
+    raw_rpms = []
+    for i in range(6):
+        delta_deg = abs(math.degrees(deltas_rad[i]))
+        motor_revs = delta_deg / 360.0 * GEAR_RATIOS[i]
+        rpm = motor_revs / (move_time / 60.0)
+        raw_rpms.append(rpm)
+
+    # Step 2: cap at MAX_RPM (scale down if needed)
+    max_raw = max(raw_rpms) if max(raw_rpms) > 0 else 1.0
+    scale_down = min(1.0, MAX_RPM / max_raw)
+
+    scaled_rpms = [rpm * scale_down for rpm in raw_rpms]
+
+    # Step 3: build final list, zeroing out joints below MIN_DELTA_RAD
+    final_rpms = []
+    for i, rpm in enumerate(scaled_rpms):
+        if abs(deltas_rad[i]) < MIN_DELTA_RAD:
+            final_rpms.append(0)
+        else:
+            final_rpms.append(max(1, int(rpm)))
+
+    # Step 4: boost at MIN_RPM (scale up if any active joint is too slow)
+    active_rpms = [r for r in final_rpms if r > 0]
+    scale_up = 1.0
+    if active_rpms:
+        min_active = min(active_rpms)
+        if min_active < MIN_RPM:
+            scale_up = MIN_RPM / min_active
+            # Make sure boosting doesn't push the max over MAX_RPM
+            max_active = max(active_rpms)
+            if max_active * scale_up > MAX_RPM:
+                scale_up = MAX_RPM / max_active
+            final_rpms = [
+                max(1, int(r * scale_up)) if r > 0 else 0
+                for r in final_rpms
+            ]
+
+    rospy.loginfo(
+        f"Velocity plan: move_time={move_time:.4f}s  "
+        f"max_raw={max_raw:.0f}  scale_down={scale_down:.3f}  "
+        f"scale_up={scale_up:.3f}  rpms={final_rpms}"
+    )
+    return final_rpms
+
+
+def send_f4(joint_idx, delta_rad, motor_rpm):
     """
     Send a single F4 relative-move command for one joint.
     delta_rad is the total move in output-shaft radians.
+    motor_rpm is the pre-computed velocity for this joint.
     Returns True if a command was sent, False if delta was too small.
     """
     if abs(delta_rad) < MIN_DELTA_RAD:
@@ -99,19 +193,16 @@ def send_f4(joint_idx, delta_rad):
     if INVERT_DIRECTION[joint_idx]:
         delta_deg = -delta_deg
 
-    # F4 relAxis = encoder counts on motor shaft
-    # motor shaft revolutions = output_revolutions * gear_ratio
     rel_axis = int(delta_deg / 360.0 * ENCODER_CPR * ratio)
-
     if rel_axis == 0:
         return False
 
-    speed_hi    = (MOTOR_SPEED >> 8) & 0xFF
-    speed_lo    =  MOTOR_SPEED       & 0xFF
-    rel_24      = rel_axis & 0xFFFFFF
-    axis_b0     = (rel_24 >> 16) & 0xFF
-    axis_b1     = (rel_24 >>  8) & 0xFF
-    axis_b2     =  rel_24        & 0xFF
+    speed_hi = (motor_rpm >> 8) & 0xFF
+    speed_lo =  motor_rpm       & 0xFF
+    rel_24   = rel_axis & 0xFFFFFF
+    axis_b0  = (rel_24 >> 16) & 0xFF
+    axis_b1  = (rel_24 >>  8) & 0xFF
+    axis_b2  =  rel_24        & 0xFF
 
     data = [0xF4, speed_hi, speed_lo, MOTOR_ACC, axis_b0, axis_b1, axis_b2]
     crc  = calculate_crc(can_id, data)
@@ -126,9 +217,8 @@ def send_f4(joint_idx, delta_rad):
         bus.send(msg)
         rospy.loginfo(
             f"CAN J{joint_idx+1} (ID {can_id}): "
-            f"delta={delta_deg:+.2f} deg "
-            f"counts={rel_axis} "
-            f"data={[hex(b) for b in data]}"
+            f"delta={delta_deg:+.2f} deg  counts={rel_axis}  "
+            f"rpm={motor_rpm}  data={[hex(b) for b in data]}"
         )
         return True
     except Exception as e:
@@ -141,7 +231,7 @@ def send_f4(joint_idx, delta_rad):
 def joint_state_callback(msg):
     """
     Store the latest joint state and timestamp every time MoveIt publishes.
-    Does not send anything; the sender thread decides when to fire.
+    Does not send anything -- the sender thread decides when to fire.
     """
     global latest_angles, last_recv_time
 
@@ -161,15 +251,17 @@ def joint_state_callback(msg):
 def can_sender_loop():
     """
     Watches for the trajectory to settle (no new messages for SETTLE_TIME),
-    then sends ONE F4 command per joint covering the full accumulated delta
-    since the last send.
+    then computes synchronized velocities and sends ONE F4 command per joint
+    covering the full accumulated delta since the last send.
 
-    After sending, publishes True on /arctos/move_complete so that
-    arctos_trajectory.py knows it can send the next waypoint.
+    move_time is latched at the moment new motion is first detected, not
+    at send time. This prevents the trajectory script from overwriting
+    the param before roscan reads it.
     """
     global last_sent_angles
 
     pending = False
+    latched_move_time = DEFAULT_MOVE_TIME
 
     while not rospy.is_shutdown():
         time.sleep(0.02)  # 50 Hz check loop
@@ -187,6 +279,17 @@ def can_sender_loop():
         deltas = [mixed_target[i] - mixed_last[i] for i in range(6)]
 
         if any(abs(d) >= MIN_DELTA_RAD for d in deltas):
+            if not pending:
+                # Latch move_time NOW, at the moment we first detect new motion.
+                # The trajectory script has already set the param for this waypoint
+                # before calling group.go(), so this captures the correct value
+                # before the script moves on and overwrites it for the next waypoint.
+                latched_move_time = rospy.get_param(
+                    "/arctos/move_time", default=DEFAULT_MOVE_TIME
+                )
+                rospy.loginfo(
+                    f"New motion detected -- latched move_time={latched_move_time:.4f}s"
+                )
             pending = True
 
         if not pending:
@@ -197,42 +300,35 @@ def can_sender_loop():
         if elapsed < SETTLE_TIME:
             continue
 
-        # Trajectory has settled. Send the full accumulated delta.
+        # Trajectory has settled -- compute velocities and send
         rospy.loginfo(
             f"Trajectory settled ({elapsed:.2f}s since last msg). "
             f"Sending full delta to motors."
         )
 
-        any_sent = False
+        joint_rpms = compute_joint_velocities(deltas, latched_move_time)
+
         for joint_idx in range(6):
-            if send_f4(joint_idx, deltas[joint_idx]):
-                any_sent = True
+            send_f4(joint_idx, deltas[joint_idx], joint_rpms[joint_idx])
 
         last_sent_angles = list(target)
         pending = False
-
-        # Notify trajectory runner that this move has been dispatched.
-        # Note: this fires after CAN commands are sent, not after motors
-        # finish moving. For true motor-complete sync you would need to
-        # read F4 ack frames here (status 0x02). The trajectory runner
-        # adds its own POST_MOVE_SETTLE delay to compensate.
-        if move_complete_pub is not None:
-            move_complete_pub.publish(Bool(data=True))
-            rospy.loginfo("Published move_complete.")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global bus, move_complete_pub
+    global bus
 
     rospy.init_node("arctos_can_bridge")
     rospy.loginfo("=" * 50)
-    rospy.loginfo("Arctos CAN bridge (settle-and-send + sync)")
+    rospy.loginfo("Arctos CAN bridge -- settle + velocity-sync mode")
     rospy.loginfo(f"Interface   : {CAN_CHANNEL}")
     rospy.loginfo(f"CAN IDs     : {CAN_IDS}")
     rospy.loginfo(f"CPR         : {ENCODER_CPR}")
-    rospy.loginfo(f"Speed       : {MOTOR_SPEED} RPM")
+    rospy.loginfo(f"Max RPM     : {MAX_RPM}")
+    rospy.loginfo(f"Min RPM     : {MIN_RPM}")
+    rospy.loginfo(f"Move time   : {DEFAULT_MOVE_TIME}s (override via /arctos/move_time)")
     rospy.loginfo(f"Accel       : {MOTOR_ACC}")
     rospy.loginfo(f"Settle time : {SETTLE_TIME}s")
     rospy.loginfo("=" * 50)
@@ -248,11 +344,6 @@ def main():
         rospy.logerr(f"Failed to open CAN bus: {e}")
         return
 
-    # Publisher so arctos_trajectory.py can synchronize
-    move_complete_pub = rospy.Publisher(
-        "/arctos/move_complete", Bool, queue_size=10
-    )
-
     rospy.Subscriber(
         "/move_group/fake_controller_joint_states",
         JointState,
@@ -261,8 +352,7 @@ def main():
     )
 
     rospy.loginfo("Subscribed to /move_group/fake_controller_joint_states")
-    rospy.loginfo("Publishing move_complete on /arctos/move_complete")
-    rospy.loginfo("Ready.")
+    rospy.loginfo("Ready -- waiting for trajectory to settle before sending.")
 
     sender = threading.Thread(target=can_sender_loop, daemon=True)
     sender.start()

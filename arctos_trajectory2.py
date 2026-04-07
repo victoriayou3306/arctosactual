@@ -37,10 +37,10 @@ ACCELERATION_SCALING = 0.1
 # Position in meters, orientation as quaternion.
 # (0, 0, 0, 1) = end effector pointing straight down from home.
 WAYPOINTS = [
-    (0.10, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
-    (0.10, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
+    (0.40, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
+    (0.30, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
+    (0.40, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
+    (0.30, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
 ]
 
 RETURN_HOME = True
@@ -99,7 +99,7 @@ class MoveSync:
     def wait_for_move(self):
         """Call this AFTER group.go() returns. Blocks until confirmed."""
         if self._connected:
-            got_it = self._event.wait(timeout=20.0)
+            got_it = self._event.wait(timeout=30.0)
             if got_it:
                 rospy.loginfo("CAN bridge confirmed move complete.")
             else:
