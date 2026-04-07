@@ -5,8 +5,17 @@ roscan2.py — MKS Servo CAN bridge for Arctos arm (F4 relative motion)
 Subscribes to /move_group/fake_controller_joint_states and sends
 F4 (relative motion by axis) commands to MKS servo drivers via CAN.
 
-After each settle-and-send cycle, publishes True on /arctos/move_complete
-so that arctos_trajectory.py can synchronize with physical moves.
+Architecture:
+  - CAN listener thread: reads all incoming frames continuously,
+    routes F4 completion acks into per-motor queues.
+  - Settle detector: waits for trajectory to stop publishing, then
+    sends ONE F4 per joint for the full accumulated delta.
+  - Ack waiter: after sending all 6 joints, waits for each motor to
+    confirm completion (status=0x02) before publishing move_complete.
+    Motors run in parallel physically; we just collect confirmations.
+
+After all motors confirm, publishes True on /arctos/move_complete so
+arctos_trajectory.py can safely send the next waypoint.
 
 Launch sequence:
   cd ~/catkin_ws/devel && source setup.bash
@@ -14,11 +23,12 @@ Launch sequence:
   python3 ~/arctosgui/roscan2.py
   rosrun moveo_moveit interface.py
   rosrun moveo_moveit transform.py
-  python3 ~/arctosgui/arctos_trajectory.py
+  python3 arctos_trajectory.py
 """
 
 import math
 import threading
+import queue
 import time
 import can
 import rospy
@@ -39,12 +49,16 @@ INVERT_DIRECTION = [True, False, True, False, True, False]
 # One full motor revolution = 0x4000 = 16384 counts (command "31").
 ENCODER_CPR = 16384
 
-MOTOR_SPEED = 1000   # RPM
+MOTOR_SPEED = 1000   # RPM (0-3000)
 MOTOR_ACC   = 20     # 0-255
 
 # How long (seconds) with no new joint state before we consider the
 # trajectory settled and send the accumulated delta as one command.
 SETTLE_TIME = 0.15
+
+# How long to wait for a motor ack before giving up.
+# Set generously: a slow move at low speed may take several seconds.
+ACK_TIMEOUT = 15.0   # seconds
 
 # Minimum total angle change (radians) to bother sending a command.
 MIN_DELTA_RAD = 0.01
@@ -61,6 +75,16 @@ last_sent_angles = [0.0] * 6
 latest_angles    = None
 last_recv_time   = None
 angles_lock      = threading.Lock()
+
+# Prevents overlapping move sequences
+move_lock = threading.Lock()
+
+# Per-motor ack queues. The CAN listener thread puts status bytes here.
+# Index by joint_idx (0-5).
+ack_queues = [queue.Queue() for _ in range(6)]
+
+# Map CAN arbitration IDs back to joint indices for ack routing
+CAN_ID_TO_JOINT = {cid: idx for idx, cid in enumerate(CAN_IDS)}
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -83,10 +107,19 @@ def apply_differential_mix(angles_rad):
     return mixed
 
 
+def clear_ack_queues():
+    """Drain any stale acks from previous moves."""
+    for q in ack_queues:
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+
 def send_f4(joint_idx, delta_rad):
     """
     Send a single F4 relative-move command for one joint.
-    delta_rad is the total move in output-shaft radians.
     Returns True if a command was sent, False if delta was too small.
     """
     if abs(delta_rad) < MIN_DELTA_RAD:
@@ -100,7 +133,6 @@ def send_f4(joint_idx, delta_rad):
         delta_deg = -delta_deg
 
     # F4 relAxis = encoder counts on motor shaft
-    # motor shaft revolutions = output_revolutions * gear_ratio
     rel_axis = int(delta_deg / 360.0 * ENCODER_CPR * ratio)
 
     if rel_axis == 0:
@@ -136,6 +168,85 @@ def send_f4(joint_idx, delta_rad):
         return False
 
 
+def wait_for_ack(joint_idx):
+    """
+    Block until motor confirms F4 completion (status 0x02) or timeout.
+
+    MKS F4 response frame: [0xF4, status]
+      status = 0x00: command failed / motor error
+      status = 0x01: command running (intermediate, keep waiting)
+      status = 0x02: command completed successfully
+      status = 0x03: end-limit stopped
+
+    Returns True if motor confirmed completion, False on timeout/error.
+    """
+    can_id = CAN_IDS[joint_idx]
+    deadline = time.time() + ACK_TIMEOUT
+
+    while time.time() < deadline:
+        try:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            status = ack_queues[joint_idx].get(timeout=min(remaining, 0.5))
+
+            if status == 0x02:
+                rospy.loginfo(f"J{joint_idx+1} (ID {can_id}): move complete (0x02)")
+                return True
+            elif status == 0x01:
+                # Still running, keep waiting
+                continue
+            elif status == 0x00:
+                rospy.logwarn(f"J{joint_idx+1} (ID {can_id}): motor error (0x00)")
+                return False
+            elif status == 0x03:
+                rospy.logwarn(f"J{joint_idx+1} (ID {can_id}): end-limit stop (0x03)")
+                return False
+            else:
+                rospy.logwarn(
+                    f"J{joint_idx+1} (ID {can_id}): unexpected status 0x{status:02X}"
+                )
+                continue
+
+        except queue.Empty:
+            continue
+
+    rospy.logwarn(
+        f"J{joint_idx+1} (ID {can_id}): ack timeout after {ACK_TIMEOUT}s. "
+        f"Position may have drifted."
+    )
+    return False
+
+
+# ── CAN LISTENER THREAD ──────────────────────────────────────────────────────
+
+def can_listener_loop():
+    """
+    Continuously reads CAN frames and routes F4 ack responses into
+    per-motor queues. Runs as a daemon thread; never blocks the sender.
+    """
+    while not rospy.is_shutdown():
+        try:
+            msg = bus.recv(timeout=0.1)
+            if msg is None:
+                continue
+
+            arb_id = msg.arbitration_id
+            data   = msg.data
+
+            # F4 response: [0xF4, status_byte]
+            if arb_id in CAN_ID_TO_JOINT and len(data) >= 2 and data[0] == 0xF4:
+                joint_idx = CAN_ID_TO_JOINT[arb_id]
+                status    = data[1]
+                ack_queues[joint_idx].put(status)
+
+        except can.CanError as e:
+            rospy.logwarn(f"CAN read error: {e}")
+        except Exception as e:
+            if not rospy.is_shutdown():
+                rospy.logwarn(f"CAN listener error: {e}")
+
+
 # ── SUBSCRIBER CALLBACK ───────────────────────────────────────────────────────
 
 def joint_state_callback(msg):
@@ -160,12 +271,10 @@ def joint_state_callback(msg):
 
 def can_sender_loop():
     """
-    Watches for the trajectory to settle (no new messages for SETTLE_TIME),
-    then sends ONE F4 command per joint covering the full accumulated delta
-    since the last send.
-
-    After sending, publishes True on /arctos/move_complete so that
-    arctos_trajectory.py knows it can send the next waypoint.
+    1. Waits for trajectory to settle (SETTLE_TIME with no new messages).
+    2. Sends ONE F4 command per joint for the full accumulated delta.
+    3. Waits for completion ack from each motor before publishing move_complete.
+    4. Motors run in parallel physically; acks are collected sequentially.
     """
     global last_sent_angles
 
@@ -197,28 +306,62 @@ def can_sender_loop():
         if elapsed < SETTLE_TIME:
             continue
 
-        # Trajectory has settled. Send the full accumulated delta.
-        rospy.loginfo(
-            f"Trajectory settled ({elapsed:.2f}s since last msg). "
-            f"Sending full delta to motors."
-        )
+        # Only one move sequence at a time
+        if not move_lock.acquire(blocking=False):
+            continue
 
-        any_sent = False
-        for joint_idx in range(6):
-            if send_f4(joint_idx, deltas[joint_idx]):
-                any_sent = True
+        try:
+            rospy.loginfo(
+                f"Trajectory settled ({elapsed:.2f}s since last msg). "
+                f"Sending full delta to motors."
+            )
 
-        last_sent_angles = list(target)
-        pending = False
+            # Clear stale acks from any previous move
+            clear_ack_queues()
 
-        # Notify trajectory runner that this move has been dispatched.
-        # Note: this fires after CAN commands are sent, not after motors
-        # finish moving. For true motor-complete sync you would need to
-        # read F4 ack frames here (status 0x02). The trajectory runner
-        # adds its own POST_MOVE_SETTLE delay to compensate.
-        if move_complete_pub is not None:
-            move_complete_pub.publish(Bool(data=True))
-            rospy.loginfo("Published move_complete.")
+            # Send all joints simultaneously
+            joints_sent = []
+            for joint_idx in range(6):
+                sent = send_f4(joint_idx, deltas[joint_idx])
+                if sent:
+                    joints_sent.append(joint_idx)
+
+            if not joints_sent:
+                rospy.loginfo("No joints needed moving (all deltas below threshold).")
+                last_sent_angles = list(target)
+                pending = False
+                continue
+
+            # Wait for all sent joints to complete
+            rospy.loginfo(
+                f"Waiting for acks from joints: "
+                f"{[j+1 for j in joints_sent]}"
+            )
+
+            all_ok = True
+            for joint_idx in joints_sent:
+                ok = wait_for_ack(joint_idx)
+                if not ok:
+                    all_ok = False
+
+            if all_ok:
+                rospy.loginfo("All motors confirmed complete.")
+            else:
+                rospy.logwarn(
+                    "Some motors timed out or errored. "
+                    "Position tracking may have drifted."
+                )
+
+            last_sent_angles = list(target)
+            pending = False
+
+            # Notify trajectory runner that this move is physically done
+            if move_complete_pub is not None:
+                move_complete_pub.publish(Bool(data=True))
+                rospy.loginfo("Published move_complete.")
+
+        finally:
+            move_lock.release()
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -228,13 +371,15 @@ def main():
 
     rospy.init_node("arctos_can_bridge")
     rospy.loginfo("=" * 50)
-    rospy.loginfo("Arctos CAN bridge (settle-and-send + sync)")
+    rospy.loginfo("Arctos CAN bridge (settle + ack-wait + sync)")
     rospy.loginfo(f"Interface   : {CAN_CHANNEL}")
     rospy.loginfo(f"CAN IDs     : {CAN_IDS}")
+    rospy.loginfo(f"Gear ratios : {GEAR_RATIOS}")
     rospy.loginfo(f"CPR         : {ENCODER_CPR}")
     rospy.loginfo(f"Speed       : {MOTOR_SPEED} RPM")
     rospy.loginfo(f"Accel       : {MOTOR_ACC}")
     rospy.loginfo(f"Settle time : {SETTLE_TIME}s")
+    rospy.loginfo(f"Ack timeout : {ACK_TIMEOUT}s")
     rospy.loginfo("=" * 50)
 
     try:
@@ -264,6 +409,11 @@ def main():
     rospy.loginfo("Publishing move_complete on /arctos/move_complete")
     rospy.loginfo("Ready.")
 
+    # Start CAN listener (reads ack frames continuously)
+    listener = threading.Thread(target=can_listener_loop, daemon=True)
+    listener.start()
+
+    # Start sender (settle-detect, send F4s, wait for acks)
     sender = threading.Thread(target=can_sender_loop, daemon=True)
     sender.start()
 
