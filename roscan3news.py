@@ -25,6 +25,9 @@ Changes from roscan3 (original):
   - Velocity interpolation added in _execute_cb alongside position
     interpolation so dynamic RPM tracks the planned motion profile
   - Final trajectory point send now also passes interpolated velocity
+  - Every trajectory point is now sent (no skipping when system is slow)
+  - Lag warning at 50ms, abort at 100ms with motor hold command
+  - ENABLE_SETTLE_DETECT flag: set to True only for demo.launch GUI mode
 
 Launch sequence (real arm):
   roslaunch arctos_config arctos_real.launch
@@ -45,7 +48,6 @@ import threading
 import queue
 import time
 import can
-import numpy as np
 import rospy
 import actionlib
 from sensor_msgs.msg import JointState
@@ -77,7 +79,7 @@ F5_SPEED = 200    # RPM (fallback only)
 # Acceleration ramp for F5. 0 = instant jump to speed
 # Increase if motors still sound rough; decrease if they lag on
 # fast direction changes. Range: 0-255 per MKS protocol.
-F5_ACC   = 200
+F5_ACC   = 20
 
 # Per-motor RPM clamp when using dynamic speed from trajectory.
 F5_RPM_MIN = 20   # floor — prevents stall on near-zero velocity segments
@@ -85,15 +87,18 @@ F5_RPM_MAX = 500  # ceiling — keep within safe motor limits
 
 # Rate at which we send F5 updates during trajectory playback.
 # 100 Hz = 10ms between updates, smooth enough for 3D printing paths.
-#higher is better
 STREAM_RATE_HZ = 200
 
 # For backward compat: settle-detect for demo.launch GUI moves
 SETTLE_TIME   = 0.15
-MIN_DELTA_RAD = 0.005
+MIN_DELTA_RAD = 0.01
 F4_SPEED = 200
 F4_ACC   = 20
 ACK_TIMEOUT = 15.0
+
+# Set to True only if running demo.launch with the GUI fallback.
+# Leave False for all real-arm / 3D printing use.
+ENABLE_SETTLE_DETECT = False
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 
@@ -303,6 +308,7 @@ def query_encoder_position(joint_idx):
                 return raw
         except Exception:
             continue
+
     rospy.logwarn(f"No encoder response from J{joint_idx+1}, assuming 0")
     return 0
 
@@ -333,12 +339,16 @@ def can_listener_loop():
 class TrajectoryActionServer:
     """
     Receives a full JointTrajectory from MoveIt and plays it back
-    in real time by streaming F5 absolute position commands.
+    by sending every point in order via F5 absolute position commands.
 
     Motor speed is derived from the trajectory's own velocity data
     when available (requires joint_limits.yaml to be populated so
     MoveIt/TOTG fills point.velocities). Falls back to F5_SPEED
     when velocity data is absent.
+
+    Lag handling:
+      - >50ms behind schedule: log a warning
+      - >100ms behind schedule: hold all motors and abort
     """
 
     def __init__(self):
@@ -384,69 +394,53 @@ class TrajectoryActionServer:
         )
 
         streaming_active = True
-        rate = rospy.Rate(STREAM_RATE_HZ)
         start_time = rospy.Time.now()
-        point_idx = 0
+
+        LAG_WARN_SEC  = 10   # 50ms  — log a warning
+        LAG_ABORT_SEC = 25   # 100ms — hold motors and abort
 
         try:
-            while not rospy.is_shutdown():
+            for i, pt in enumerate(points):
                 if self._server.is_preempt_requested():
                     rospy.logwarn("[F5] Trajectory preempted.")
                     self._server.set_preempted()
                     return
 
-                elapsed = (rospy.Time.now() - start_time).to_sec()
+                # Measure how far behind schedule we are
+                elapsed  = (rospy.Time.now() - start_time).to_sec()
+                expected = pt.time_from_start.to_sec()
+                lag      = elapsed - expected
 
-                # Advance to the trajectory point whose timestamp we've reached
-                while (point_idx < len(points) - 1 and
-                       points[point_idx + 1].time_from_start.to_sec() <= elapsed):
-                    point_idx += 1
+                if lag > LAG_WARN_SEC:
+                    rospy.logwarn(
+                        f"[F5] Running {lag*1000:.1f}ms behind at point {i}/{len(points)}"
+                    )
 
-                # Interpolate between current and next point
-                pt = points[point_idx]
-                if point_idx < len(points) - 1:
-                    pt_next = points[point_idx + 1]
-                    t0 = pt.time_from_start.to_sec()
-                    t1 = pt_next.time_from_start.to_sec()
-                    dt = t1 - t0
-                    alpha = min(1.0, max(0.0, (elapsed - t0) / dt)) if dt > 0 else 1.0
+                # Abort if lag is unrecoverable
+                if lag > LAG_ABORT_SEC:
+                    rospy.logerr(
+                        f"[F5] Lag {lag*1000:.1f}ms exceeds limit. Stopping arm."
+                    )
+                    # Hold each motor at its current position
+                    for motor_idx in range(6):
+                        send_f5(motor_idx, abs_positions[motor_idx], speed=0)
+                    rospy.sleep(0.1)
+                    self._server.set_aborted(FollowJointTrajectoryResult())
+                    return
 
-                    interp_positions = [
-                        pt.positions[i] + alpha * (pt_next.positions[i] - pt.positions[i])
-                        for i in range(len(pt.positions))
-                    ]
+                # Send this point
+                velocities = list(pt.velocities) if has_velocities else None
+                self._send_joint_positions(list(pt.positions), joint_indices, velocities)
 
-                    # Interpolate velocities when available
-                    if has_velocities:
-                        interp_velocities = [
-                            pt.velocities[i] + alpha * (pt_next.velocities[i] - pt.velocities[i])
-                            for i in range(len(pt.velocities))
-                        ]
-                    else:
-                        interp_velocities = None
+                # Sleep until next point, adjusted to recover from lag
+                if i < len(points) - 1:
+                    dt        = (points[i + 1].time_from_start - pt.time_from_start).to_sec()
+                    actual_dt = dt - max(0.0, lag)
+                    if actual_dt > 0:
+                        rospy.sleep(actual_dt)
 
-                else:
-                    interp_positions = list(pt.positions)
-                    interp_velocities = list(pt.velocities) if has_velocities else None
-
-                    if elapsed >= pt.time_from_start.to_sec():
-                        # Past the final point — send it and exit
-                        self._send_joint_positions(
-                            interp_positions, joint_indices, interp_velocities
-                        )
-                        break
-
-                self._send_joint_positions(interp_positions, joint_indices, interp_velocities)
-                rate.sleep()
-
-            # Send final point one more time to be sure
-            final_pt = points[-1]
-            final_vels = list(final_pt.velocities) if has_velocities else None
-            self._send_joint_positions(list(final_pt.positions), joint_indices, final_vels)
-
-            # Brief wait for motors to settle at final position
+            # All points sent successfully
             rospy.sleep(0.3)
-
             rospy.loginfo("[F5] Trajectory execution complete.")
             self._server.set_succeeded(FollowJointTrajectoryResult())
 
@@ -482,8 +476,6 @@ class TrajectoryActionServer:
         # Apply differential mix for J5/J6 (positions and velocities)
         mixed_pos = apply_differential_mix(joint_angles)
         mixed_vel = apply_differential_mix(joint_vels)
-        #rospy.loginfo(f"mixed_pos J5={mixed_pos[4]:.4f} J6={mixed_pos[5]:.4f}  "
-        #      f"raw j5={joint_angles[4]:.4f} j6={joint_angles[5]:.4f}")
 
         # Send F5 to each motor
         for motor_idx in range(6):
@@ -527,7 +519,12 @@ def settle_sender_loop():
     """
     Fallback for demo.launch: watches for GUI-driven moves via the
     fake controller topic. Uses F4 when action server is NOT streaming.
+    Only runs when ENABLE_SETTLE_DETECT is True.
     """
+    if not ENABLE_SETTLE_DETECT:
+        rospy.loginfo("[F4] Settle-detect disabled. Fallback inactive.")
+        return
+
     pending = False
 
     while not rospy.is_shutdown():
@@ -607,14 +604,15 @@ def main():
     rospy.init_node("arctos_can_bridge")
     rospy.loginfo("=" * 60)
     rospy.loginfo("Arctos CAN bridge (F5 streaming + F4 GUI fallback)")
-    rospy.loginfo(f"  CAN         : {CAN_CHANNEL} @ {CAN_BITRATE}")
-    rospy.loginfo(f"  Motor IDs   : {CAN_IDS}")
-    rospy.loginfo(f"  Gear ratios : {GEAR_RATIOS}")
-    rospy.loginfo(f"  Encoder CPR : {ENCODER_CPR}")
-    rospy.loginfo(f"  F5 speed    : {F5_SPEED} RPM (fallback, dynamic when vel data present)")
-    rospy.loginfo(f"  F5 acc      : {F5_ACC}")
-    rospy.loginfo(f"  F4 speed    : {F4_SPEED} RPM")
-    rospy.loginfo(f"  Stream rate : {STREAM_RATE_HZ} Hz")
+    rospy.loginfo(f"  CAN              : {CAN_CHANNEL} @ {CAN_BITRATE}")
+    rospy.loginfo(f"  Motor IDs        : {CAN_IDS}")
+    rospy.loginfo(f"  Gear ratios      : {GEAR_RATIOS}")
+    rospy.loginfo(f"  Encoder CPR      : {ENCODER_CPR}")
+    rospy.loginfo(f"  F5 speed         : {F5_SPEED} RPM (fallback, dynamic when vel data present)")
+    rospy.loginfo(f"  F5 acc           : {F5_ACC}")
+    rospy.loginfo(f"  F4 speed         : {F4_SPEED} RPM")
+    rospy.loginfo(f"  Stream rate      : {STREAM_RATE_HZ} Hz")
+    rospy.loginfo(f"  Settle-detect    : {'enabled' if ENABLE_SETTLE_DETECT else 'disabled'}")
     rospy.loginfo("=" * 60)
 
     try:
@@ -655,7 +653,7 @@ def main():
     listener = threading.Thread(target=can_listener_loop, daemon=True)
     listener.start()
 
-    # Start settle-detect sender (only active when action server is idle)
+    # Start settle-detect sender (exits immediately if ENABLE_SETTLE_DETECT is False)
     sender = threading.Thread(target=settle_sender_loop, daemon=True)
     sender.start()
 

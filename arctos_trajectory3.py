@@ -19,6 +19,7 @@ Launch order:
 """
 
 import sys
+import os
 import rospy
 import moveit_commander
 import geometry_msgs.msg
@@ -30,23 +31,24 @@ from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryG
 #  CONFIGURATION
 # ─────────────────────────────────────────────
 
-VELOCITY_SCALING     = 0.6
-ACCELERATION_SCALING = 1.0
+VELOCITY_SCALING     = 0.3
+ACCELERATION_SCALING = 0.6
 
 # Cartesian path resolution in meters (smaller = smoother)
-CARTESIAN_STEP = 0.005
+CARTESIAN_STEP = 0.001
 
 # Abort if planner can't achieve this fraction of the path
 MIN_FRACTION = 0.95
 
+
 # Each target point: (x, y, z, qx, qy, qz, qw)
-WAYPOINTS = [
-    (0.20, -0.31, 0.0896, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.31, 0.0896, 0.0, 0.0, 0.0, 1.0),
-    (-0.20, -0.31, 0.0896, 0.0, 0.0, 0.0, 1.0),
-    (-0.20, -0.41, 0.0896, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.41, 0.0896, 0.0, 0.0, 0.0, 1.0),
-    (0.2, -0.41, 0.0896, 0.0, 0.0, 0.0, 1.0),
+TARGETS = [
+    (0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.2, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
 ]
 
 RETURN_HOME = True
@@ -137,19 +139,51 @@ def run_trajectory():
     rospy.loginfo("Arctos smooth trajectory runner")
     rospy.loginfo(f"  Planning frame : {group.get_planning_frame()}")
     rospy.loginfo(f"  End effector   : {group.get_end_effector_link()}")
-    rospy.loginfo(f"  Waypoints      : {len(WAYPOINTS)}")
+    rospy.loginfo(f"  Waypoints      : {len(TARGETS)}")
     rospy.loginfo(f"  Return home    : {RETURN_HOME}")
     rospy.loginfo("=" * 50)
 
     # ── Plan continuous Cartesian path through all waypoints ──
-    poses = [make_pose(*wp) for wp in WAYPOINTS]
+    start_pose = group.get_current_pose().pose
+    print("START", start_pose)
+    poses = [start_pose] + [make_pose(*wp) for wp in TARGETS]
 
     rospy.loginfo("Planning Cartesian path through all waypoints...")
-    (plan, fraction) = group.compute_cartesian_path(
-        poses,
-        CARTESIAN_STEP,
-        True,  # jump threshold (0.0 = disabled)
-    )
+    
+    # Set path constraints to lock orientation throughout
+    from moveit_msgs.msg import Constraints, OrientationConstraint
+    from geometry_msgs.msg import Quaternion
+    oc = OrientationConstraint()
+    oc.header.frame_id = group.get_planning_frame()
+    oc.link_name = group.get_end_effector_link()
+    oc.orientation.x = 0.0
+    oc.orientation.y = 0.0
+    oc.orientation.z = 0.0
+    oc.orientation.w = 1.0
+    oc.absolute_x_axis_tolerance = 0.05  # tighten as needed
+    oc.absolute_y_axis_tolerance = 0.05
+    oc.absolute_z_axis_tolerance = 0.05
+    oc.weight = 1.0
+    
+    constraints = Constraints()
+    constraints.orientation_constraints.append(oc)
+    group.set_path_constraints(constraints)
+    (plan, fraction) = group.compute_cartesian_path(poses, CARTESIAN_STEP, True)
+    group.clear_path_constraints()  # always clear after
+
+    
+    log_path = os.path.expanduser("~/arctosgui/trajectory_log.txt")
+    with open(log_path, "w") as f:
+        f.write(f"Trajectory: {len(plan.joint_trajectory.points)} points, "
+                f"duration {plan.joint_trajectory.points[-1].time_from_start.to_sec():.2f}s\n\n")
+        for i, pt in enumerate(plan.joint_trajectory.points):
+            pos = pt.positions
+            vel = pt.velocities if pt.velocities else [0]*len(pos)
+            f.write(f"pt {i:04d} t={pt.time_from_start.to_sec():.3f}s  ")
+            f.write("  ".join(f"j{j+1}={pos[j]:.4f}(v={vel[j]:.4f})" for j in range(len(pos))))
+            f.write("\n")
+    rospy.loginfo(f"Trajectory log saved to {log_path}")
+
 
     rospy.loginfo(f"Path coverage: {fraction * 100:.1f}%")
 
