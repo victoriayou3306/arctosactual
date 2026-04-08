@@ -30,8 +30,8 @@ from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryG
 #  CONFIGURATION
 # ─────────────────────────────────────────────
 
-VELOCITY_SCALING     = 0.3
-ACCELERATION_SCALING = 0.2
+VELOCITY_SCALING     = 0.6
+ACCELERATION_SCALING = 0.4
 
 # Cartesian path resolution in meters (smaller = smoother)
 CARTESIAN_STEP = 0.01
@@ -41,10 +41,12 @@ MIN_FRACTION = 0.95
 
 # Each waypoint: (x, y, z, qx, qy, qz, qw)
 WAYPOINTS = [
-    (0.10, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
-    (0.10, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.31, 0.1796, 0.0, 0.0, 0.0, 1.0),
+    (0.20, -0.31, 0.1596, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1596, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.31, 0.1596, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.41, 0.1596, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.41, 0.1596, 0.0, 0.0, 0.0, 1.0),
+    (0.2, -0.41, 0.1596, 0.0, 0.0, 0.0, 1.0),
 ]
 
 RETURN_HOME = True
@@ -174,16 +176,13 @@ def run_trajectory():
         rospy.logerr("Trajectory execution failed.")
         return
 
-    # ── Return to home ──
+# ── Return to home ──
     if RETURN_HOME:
         rospy.loginfo("Planning return to home...")
         group.set_named_target("home")
 
-        # Plan the home move
         home_plan = group.plan()
 
-        # group.plan() returns (success, plan, ...) in newer MoveIt
-        # or just the plan in older versions
         if isinstance(home_plan, tuple):
             plan_success = home_plan[0]
             home_plan = home_plan[1]
@@ -191,26 +190,24 @@ def run_trajectory():
             plan_success = True
 
         if not plan_success or len(home_plan.joint_trajectory.points) == 0:
-	    rospy.logerr("Home planning failed.")
-	    return
+            rospy.logerr("Home planning failed.")
+            return
 
-	# Retime home trajectory — without this it's only 2 points / 0.02s
-	home_plan = group.retime_trajectory(
-	    robot.get_current_state(),
-	    home_plan,
-	    VELOCITY_SCALING,
-	    ACCELERATION_SCALING,
-	    algorithm="time_optimal_trajectory_generation",
-	)
+        home_plan = group.retime_trajectory(
+            robot.get_current_state(),
+            home_plan,
+            VELOCITY_SCALING,
+            ACCELERATION_SCALING,
+            algorithm="time_optimal_trajectory_generation",
+        )
 
-	rospy.loginfo(
-	    f"Home trajectory: {len(home_plan.joint_trajectory.points)} points, "
-	    f"duration {home_plan.joint_trajectory.points[-1].time_from_start.to_sec():.2f}s"
-	)
+        rospy.loginfo(
+            f"Home trajectory: {len(home_plan.joint_trajectory.points)} points, "
+            f"duration {home_plan.joint_trajectory.points[-1].time_from_start.to_sec():.2f}s"
+        )
         execute_via_action_server(client, robot, group, home_plan)
 
     rospy.loginfo("Done.")
-
 
 if __name__ == "__main__":
     try:

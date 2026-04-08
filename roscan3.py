@@ -14,6 +14,18 @@ Also retains the settle-detect F4 fallback for use with demo.launch
 go through the action server and settle-detect is automatically
 inactive.
 
+Changes from roscan3 (original):
+  - F5_ACC raised from 0 → 5 (smooth acceleration ramp, eliminates
+    the "crunchy" instant-speed-jump on every F5 update)
+  - STREAM_RATE_HZ raised from 30 → 100 Hz (10ms update interval,
+    much smoother position tracking)
+  - F5_SPEED is now a fallback only; _send_joint_positions accepts
+    an optional velocities argument and derives per-motor RPM from
+    the trajectory's own velocity data when available
+  - Velocity interpolation added in _execute_cb alongside position
+    interpolation so dynamic RPM tracks the planned motion profile
+  - Final trajectory point send now also passes interpolated velocity
+
 Launch sequence (real arm):
   roslaunch arctos_config arctos_real.launch
   python3 ~/arctosgui/roscan3.py
@@ -56,14 +68,23 @@ INVERT_DIRECTION = [True, False, True, False, True, False]
 
 ENCODER_CPR = 16384
 
-# F5 streaming: speed the motor uses to track each streamed target.
-# Keep this moderate. Too high = overshoot on direction changes.
-# Too low = motor can't keep up with trajectory rate and lags.
-F5_SPEED = 200    # RPM
-F5_ACC   = 5      # 0 = no ramp, move at set speed instantly
+# F5 streaming: fallback speed used when trajectory velocity data is
+# unavailable. Dynamic RPM derived from trajectory velocities is
+# preferred and will be used whenever MoveIt populates point.velocities.
+F5_SPEED = 200    # RPM (fallback only)
+
+# Acceleration ramp for F5. 0 = instant jump to speed (crunchy).
+# Increase if motors still sound rough; decrease if they lag on
+# fast direction changes. Range: 0-255 per MKS protocol.
+F5_ACC   = 20
+
+# Per-motor RPM clamp when using dynamic speed from trajectory.
+F5_RPM_MIN = 20   # floor — prevents stall on near-zero velocity segments
+F5_RPM_MAX = 250  # ceiling — keep within safe motor limits
 
 # Rate at which we send F5 updates during trajectory playback.
-STREAM_RATE_HZ = 100
+# 100 Hz = 10ms between updates, smooth enough for 3D printing paths.
+STREAM_RATE_HZ = 200
 
 # For backward compat: settle-detect for demo.launch GUI moves
 SETTLE_TIME   = 0.15
@@ -107,15 +128,16 @@ def calculate_crc(can_id, data_bytes):
     return (can_id + sum(data_bytes)) & 0xFF
 
 
-def apply_differential_mix(angles_rad):
+def apply_differential_mix(values):
     """
     Bevel-gear differential for joints 5/6.
     M5 = (C + B) / 2,  M6 = (C - B) / 2
     where C = joint5, B = joint6 in MoveIt ordering.
+    Works for both positions (rad) and velocities (rad/s).
     """
-    mixed = list(angles_rad)
-    c = angles_rad[4]
-    b = angles_rad[5]
+    mixed = list(values)
+    c = values[4]
+    b = values[5]
     mixed[4] = (c + b) / 2.0
     mixed[5] = (c - b) / 2.0
     return mixed
@@ -128,6 +150,16 @@ def rad_to_encoder_counts(joint_idx, angle_rad):
     if INVERT_DIRECTION[joint_idx]:
         deg = -deg
     return int(deg / 360.0 * ENCODER_CPR * ratio)
+
+
+def rad_s_to_rpm(joint_idx, vel_rad_s):
+    """
+    Convert output-shaft velocity (rad/s) to motor-shaft RPM,
+    accounting for gear ratio. Returns clamped value within
+    [F5_RPM_MIN, F5_RPM_MAX].
+    """
+    rpm = abs(vel_rad_s) * GEAR_RATIOS[joint_idx] * 60.0 / (2.0 * math.pi)
+    return int(max(F5_RPM_MIN, min(rpm, F5_RPM_MAX)))
 
 
 def send_f5(joint_idx, abs_counts, speed=None, acc=None):
@@ -269,7 +301,6 @@ def query_encoder_position(joint_idx):
                 return raw
         except Exception:
             continue
-
     rospy.logwarn(f"No encoder response from J{joint_idx+1}, assuming 0")
     return 0
 
@@ -285,11 +316,9 @@ def can_listener_loop():
                 continue
             arb_id = msg.arbitration_id
             data = msg.data
-
             if arb_id in CAN_ID_TO_JOINT and len(data) >= 2 and data[0] == 0xF4:
                 joint_idx = CAN_ID_TO_JOINT[arb_id]
                 ack_queues[joint_idx].put(data[1])
-
         except can.CanError as e:
             rospy.logwarn(f"CAN read error: {e}")
         except Exception as e:
@@ -303,6 +332,11 @@ class TrajectoryActionServer:
     """
     Receives a full JointTrajectory from MoveIt and plays it back
     in real time by streaming F5 absolute position commands.
+
+    Motor speed is derived from the trajectory's own velocity data
+    when available (requires joint_limits.yaml to be populated so
+    MoveIt/TOTG fills point.velocities). Falls back to F5_SPEED
+    when velocity data is absent.
     """
 
     def __init__(self):
@@ -335,9 +369,16 @@ class TrajectoryActionServer:
                 rospy.logwarn(f"Unknown joint in trajectory: {name}")
                 joint_indices.append(-1)
 
+        # Check whether velocity data is populated in this trajectory
+        has_velocities = (
+            len(points[0].velocities) == len(points[0].positions)
+            and len(points[0].velocities) > 0
+        )
+
         rospy.loginfo(
             f"[F5] Trajectory received: {len(points)} points, "
-            f"duration {points[-1].time_from_start.to_sec():.2f}s"
+            f"duration {points[-1].time_from_start.to_sec():.2f}s, "
+            f"velocity data: {'yes' if has_velocities else 'no (using fallback RPM)'}"
         )
 
         streaming_active = True
@@ -366,28 +407,40 @@ class TrajectoryActionServer:
                     t0 = pt.time_from_start.to_sec()
                     t1 = pt_next.time_from_start.to_sec()
                     dt = t1 - t0
-                    if dt > 0:
-                        alpha = min(1.0, max(0.0, (elapsed - t0) / dt))
-                    else:
-                        alpha = 1.0
+                    alpha = min(1.0, max(0.0, (elapsed - t0) / dt)) if dt > 0 else 1.0
 
                     interp_positions = [
                         pt.positions[i] + alpha * (pt_next.positions[i] - pt.positions[i])
                         for i in range(len(pt.positions))
                     ]
+
+                    # Interpolate velocities when available
+                    if has_velocities:
+                        interp_velocities = [
+                            pt.velocities[i] + alpha * (pt_next.velocities[i] - pt.velocities[i])
+                            for i in range(len(pt.velocities))
+                        ]
+                    else:
+                        interp_velocities = None
+
                 else:
                     interp_positions = list(pt.positions)
+                    interp_velocities = list(pt.velocities) if has_velocities else None
+
                     if elapsed >= pt.time_from_start.to_sec():
-                        # Past the final point, send it and exit
-                        self._send_joint_positions(interp_positions, joint_indices)
+                        # Past the final point — send it and exit
+                        self._send_joint_positions(
+                            interp_positions, joint_indices, interp_velocities
+                        )
                         break
 
-                self._send_joint_positions(interp_positions, joint_indices)
+                self._send_joint_positions(interp_positions, joint_indices, interp_velocities)
                 rate.sleep()
 
             # Send final point one more time to be sure
             final_pt = points[-1]
-            self._send_joint_positions(list(final_pt.positions), joint_indices)
+            final_vels = list(final_pt.velocities) if has_velocities else None
+            self._send_joint_positions(list(final_pt.positions), joint_indices, final_vels)
 
             # Brief wait for motors to settle at final position
             rospy.sleep(0.3)
@@ -401,27 +454,43 @@ class TrajectoryActionServer:
         finally:
             streaming_active = False
 
-    def _send_joint_positions(self, positions, joint_indices):
+    def _send_joint_positions(self, positions, joint_indices, velocities=None):
         """
-        Convert joint positions (radians) to absolute encoder counts
-        and send F5 commands to all motors. Also updates last_sent_angles
-        so that any subsequent settle-detect moves use the correct baseline.
+        Convert joint positions (radians) to absolute encoder counts and
+        send F5 commands to all motors.
+
+        When velocities (rad/s) are provided, derives per-motor RPM from
+        the trajectory's own velocity profile via the gear ratio. Falls
+        back to the global F5_SPEED constant when velocities is None.
+
+        Also updates last_sent_angles so that any subsequent settle-detect
+        moves use the correct baseline.
         """
-        # Build full 6-joint array
         with last_sent_lock:
             joint_angles = list(last_sent_angles)
+
+        joint_vels = [0.0] * 6
 
         for traj_idx, joint_idx in enumerate(joint_indices):
             if joint_idx >= 0 and traj_idx < len(positions):
                 joint_angles[joint_idx] = positions[traj_idx]
+                if velocities and traj_idx < len(velocities):
+                    joint_vels[joint_idx] = abs(velocities[traj_idx])
 
-        # Apply differential mix for J5/J6
-        mixed = apply_differential_mix(joint_angles)
+        # Apply differential mix for J5/J6 (positions and velocities)
+        mixed_pos = apply_differential_mix(joint_angles)
+        mixed_vel = apply_differential_mix(joint_vels)
 
         # Send F5 to each motor
         for motor_idx in range(6):
-            target_counts = rad_to_encoder_counts(motor_idx, mixed[motor_idx])
-            send_f5(motor_idx, target_counts)
+            target_counts = rad_to_encoder_counts(motor_idx, mixed_pos[motor_idx])
+
+            if velocities is not None and mixed_vel[motor_idx] > 0.001:
+                rpm = rad_s_to_rpm(motor_idx, mixed_vel[motor_idx])
+            else:
+                rpm = F5_SPEED  # fallback when no velocity data
+
+            send_f5(motor_idx, target_counts, speed=rpm)
             abs_positions[motor_idx] = target_counts
 
         # Update shared state so settle-detect knows where we are
@@ -538,7 +607,8 @@ def main():
     rospy.loginfo(f"  Motor IDs   : {CAN_IDS}")
     rospy.loginfo(f"  Gear ratios : {GEAR_RATIOS}")
     rospy.loginfo(f"  Encoder CPR : {ENCODER_CPR}")
-    rospy.loginfo(f"  F5 speed    : {F5_SPEED} RPM")
+    rospy.loginfo(f"  F5 speed    : {F5_SPEED} RPM (fallback, dynamic when vel data present)")
+    rospy.loginfo(f"  F5 acc      : {F5_ACC}")
     rospy.loginfo(f"  F4 speed    : {F4_SPEED} RPM")
     rospy.loginfo(f"  Stream rate : {STREAM_RATE_HZ} Hz")
     rospy.loginfo("=" * 60)
