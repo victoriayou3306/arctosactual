@@ -144,9 +144,7 @@ def run_trajectory():
     rospy.loginfo("=" * 50)
 
     # ── Plan continuous Cartesian path through all waypoints ──
-    start_pose = group.get_current_pose().pose
-    print("START", start_pose)
-    poses = [start_pose] + [make_pose(*wp) for wp in TARGETS]
+    poses = [make_pose(*wp) for wp in TARGETS]
 
     rospy.loginfo("Planning Cartesian path through all waypoints...")
     

@@ -488,12 +488,13 @@ class TrajectoryActionServer:
         # Send F5 to each motor
         for motor_idx in range(6):
             target_counts = rad_to_encoder_counts(motor_idx, mixed_pos[motor_idx])
-
+            # Only use dynamic RPM if we have velocity data AND it's meaningful 
             if velocities is not None and mixed_vel[motor_idx] > 0.001:
                 rpm = rad_s_to_rpm(motor_idx, mixed_vel[motor_idx])
+            elif velocities is not None and mixed_vel[motor_idx] <= 0.001:
+                rpm = F5_RPM_MIN
             else:
-                rpm = F5_SPEED  # fallback when no velocity data
-
+                rpm = F5_SPEED  # only true fallback when no velocity data at all
             send_f5(motor_idx, target_counts, speed=rpm)
             abs_positions[motor_idx] = target_counts
 
