@@ -31,22 +31,22 @@ from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryG
 # ─────────────────────────────────────────────
 
 VELOCITY_SCALING     = 0.6
-ACCELERATION_SCALING = 0.4
+ACCELERATION_SCALING = 1.0
 
 # Cartesian path resolution in meters (smaller = smoother)
-CARTESIAN_STEP = 0.01
+CARTESIAN_STEP = 0.005
 
 # Abort if planner can't achieve this fraction of the path
 MIN_FRACTION = 0.95
 
-# Each waypoint: (x, y, z, qx, qy, qz, qw)
+# Each target point: (x, y, z, qx, qy, qz, qw)
 WAYPOINTS = [
-    (0.20, -0.31, 0.1596, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.31, 0.1596, 0.0, 0.0, 0.0, 1.0),
-    (-0.20, -0.31, 0.1596, 0.0, 0.0, 0.0, 1.0),
-    (-0.20, -0.41, 0.1596, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.41, 0.1596, 0.0, 0.0, 0.0, 1.0),
-    (0.2, -0.41, 0.1596, 0.0, 0.0, 0.0, 1.0),
+    (0.20, -0.31, 0.0896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.0896, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.31, 0.0896, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.41, 0.0896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.41, 0.0896, 0.0, 0.0, 0.0, 1.0),
+    (0.2, -0.41, 0.0896, 0.0, 0.0, 0.0, 1.0),
 ]
 
 RETURN_HOME = True

@@ -73,17 +73,18 @@ ENCODER_CPR = 16384
 # preferred and will be used whenever MoveIt populates point.velocities.
 F5_SPEED = 200    # RPM (fallback only)
 
-# Acceleration ramp for F5. 0 = instant jump to speed (crunchy).
+# Acceleration ramp for F5. 0 = instant jump to speed
 # Increase if motors still sound rough; decrease if they lag on
 # fast direction changes. Range: 0-255 per MKS protocol.
 F5_ACC   = 20
 
 # Per-motor RPM clamp when using dynamic speed from trajectory.
 F5_RPM_MIN = 20   # floor — prevents stall on near-zero velocity segments
-F5_RPM_MAX = 250  # ceiling — keep within safe motor limits
+F5_RPM_MAX = 500  # ceiling — keep within safe motor limits
 
 # Rate at which we send F5 updates during trajectory playback.
 # 100 Hz = 10ms between updates, smooth enough for 3D printing paths.
+#higher is better
 STREAM_RATE_HZ = 200
 
 # For backward compat: settle-detect for demo.launch GUI moves
