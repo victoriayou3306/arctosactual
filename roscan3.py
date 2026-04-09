@@ -486,13 +486,14 @@ class TrajectoryActionServer:
         #      f"raw j5={joint_angles[4]:.4f} j6={joint_angles[5]:.4f}")
 
         # Send F5 to each motor
+        rpm_floor = rospy.get_param('/arctos/rpm_floor', F5_RPM_MIN)
         for motor_idx in range(6):
             target_counts = rad_to_encoder_counts(motor_idx, mixed_pos[motor_idx])
             # Only use dynamic RPM if we have velocity data AND it's meaningful 
             if velocities is not None and mixed_vel[motor_idx] > 0.001:
                 rpm = rad_s_to_rpm(motor_idx, mixed_vel[motor_idx])
             elif velocities is not None and mixed_vel[motor_idx] <= 0.001:
-                rpm = F5_RPM_MIN
+                rpm = rpm_floor
             else:
                 rpm = F5_SPEED  # only true fallback when no velocity data at all
             send_f5(motor_idx, target_counts, speed=rpm)

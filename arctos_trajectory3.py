@@ -34,6 +34,8 @@ from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryG
 VELOCITY_SCALING     = 0.3
 ACCELERATION_SCALING = 0.6
 
+rospy.set_param('/arctos/rpm_floor', 200)
+
 # Cartesian path resolution in meters (smaller = smoother)
 CARTESIAN_STEP = 0.001
 
@@ -252,9 +254,9 @@ def run_trajectory():
             f"Home trajectory: {len(home_plan.joint_trajectory.points)} points, "
             f"duration {home_plan.joint_trajectory.points[-1].time_from_start.to_sec():.2f}s"
         )
-        #rospy.set_param('/arctos/home_speed_rpm', 300)
+        rospy.set_param('/arctos/rpm_floor', 200)
         execute_via_action_server(client, robot, group, home_plan)
-        #rospy.delete_param('/arctos/home_speed_rpm')
+        rospy.set_param('/arctos/rpm_floor', 20)
 
     current_pose = group.get_current_pose().pose
     print(current_pose)
