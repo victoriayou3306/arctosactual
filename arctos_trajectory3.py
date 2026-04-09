@@ -46,10 +46,25 @@ TARGETS = [
     (0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
     (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
     (-0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
-    (-0.20, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
-    (0.0, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
-    (0.2, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (-0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
 ]
+
+#TARGETS = [
+#    (0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+#    (0.0, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+#    (-0.20, -0.31, 0.1896, 0.0, 0.0, 0.0, 1.0),
+#    (-0.20, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
+#    (0.0, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
+#    (0.2, -0.41, 0.1896, 0.0, 0.0, 0.0, 1.0),
+#]
 
 RETURN_HOME = True
 
@@ -228,7 +243,7 @@ def run_trajectory():
         home_plan = group.retime_trajectory(
             robot.get_current_state(),
             home_plan,
-            VELOCITY_SCALING,
+            2,
             ACCELERATION_SCALING,
             algorithm="time_optimal_trajectory_generation",
         )
@@ -237,8 +252,12 @@ def run_trajectory():
             f"Home trajectory: {len(home_plan.joint_trajectory.points)} points, "
             f"duration {home_plan.joint_trajectory.points[-1].time_from_start.to_sec():.2f}s"
         )
+        #rospy.set_param('/arctos/home_speed_rpm', 300)
         execute_via_action_server(client, robot, group, home_plan)
+        #rospy.delete_param('/arctos/home_speed_rpm')
 
+    current_pose = group.get_current_pose().pose
+    print(current_pose)
     rospy.loginfo("Done.")
 
 if __name__ == "__main__":
