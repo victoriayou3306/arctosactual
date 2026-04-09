@@ -71,9 +71,18 @@ F5_ACC   = 200
 F5_RPM_MIN = 20   # floor — prevents stall on near-zero velocity segments
 F5_RPM_MAX = 500  # ceiling — keep within safe motor limits
 
+# P term gain for position feedback correction.
+# Units: (rad/s) per rad, i.e. 1/s — fed through rad_s_to_rpm for conversion.
+# Start at 0.0 to verify encoder reading works, then increase slowly.
+Kp = 0.05
+
+# Shared array of actual joint positions in radians, updated asynchronously
+# by the CAN listener thread from 0x31 encoder response frames.
+encoder_feedback_rad = [0.0] * 6
+
 # Rate at which we send F5 updates during trajectory playback.
 # 100 Hz = 10ms between updates, smooth enough for 3D printing paths.
-#higher is better
+# Higher is better.
 STREAM_RATE_HZ = 200
 
 # For backward compat: settle-detect for demo.launch GUI moves
@@ -263,6 +272,9 @@ def query_encoder_position(joint_idx):
     """
     Query motor's current absolute encoder value using command 0x31.
     Returns int48 encoder count, or 0 on failure.
+    Used only at startup for initial position sync.
+    During trajectory execution, encoder positions are updated
+    asynchronously by the CAN listener thread.
     """
     can_id = CAN_IDS[joint_idx]
     data = [0x31]
@@ -298,7 +310,11 @@ def query_encoder_position(joint_idx):
 # ── CAN LISTENER THREAD ──────────────────────────────────────────────────────
 
 def can_listener_loop():
-    """Read CAN frames and route F4 acks into per-motor queues."""
+    """
+    Read CAN frames and route responses:
+      - F4 acks (0xF4) into per-motor queues for settle-detect
+      - Encoder responses (0x31) into encoder_feedback_rad for P term
+    """
     while not rospy.is_shutdown():
         try:
             msg = bus.recv(timeout=0.1)
@@ -306,14 +322,56 @@ def can_listener_loop():
                 continue
             arb_id = msg.arbitration_id
             data = msg.data
-            if arb_id in CAN_ID_TO_JOINT and len(data) >= 2 and data[0] == 0xF4:
+            if arb_id in CAN_ID_TO_JOINT and len(data) >= 2:
                 joint_idx = CAN_ID_TO_JOINT[arb_id]
-                ack_queues[joint_idx].put(data[1])
+                if data[0] == 0xF4:
+                    ack_queues[joint_idx].put(data[1])
+                elif data[0] == 0x31 and len(data) >= 8:
+                    # Decode int48 encoder count
+                    raw = 0
+                    for i in range(1, 7):
+                        raw = (raw << 8) | data[i]
+                    if raw >= (1 << 47):
+                        raw -= (1 << 48)
+                    # Convert encoder counts back to output-shaft radians
+                    angle_rad = math.radians(
+                        raw / (ENCODER_CPR * GEAR_RATIOS[joint_idx]) * 360.0
+                    )
+                    if INVERT_DIRECTION[joint_idx]:
+                        angle_rad = -angle_rad
+                    encoder_feedback_rad[joint_idx] = angle_rad
         except can.CanError as e:
             rospy.logwarn(f"CAN read error: {e}")
         except Exception as e:
             if not rospy.is_shutdown():
                 rospy.logwarn(f"CAN listener error: {e}")
+
+
+# ── ENCODER QUERY BROADCASTER THREAD ─────────────────────────────────────────
+
+def encoder_query_loop():
+    """
+    Broadcast 0x31 encoder position queries to all joints in round-robin.
+    Responses are captured asynchronously by can_listener_loop and stored
+    in encoder_feedback_rad for use by the P term in _send_joint_positions.
+    Querying one joint per tick at STREAM_RATE_HZ means each joint gets
+    a fresh reading every 6 ticks (~30ms at 200Hz), which is sufficient
+    for the outer position control loop.
+    """
+    joint_idx = 0
+    rate = rospy.Rate(STREAM_RATE_HZ)
+    while not rospy.is_shutdown():
+        can_id = CAN_IDS[joint_idx]
+        data = [0x31]
+        crc = calculate_crc(can_id, data)
+        data.append(crc)
+        try:
+            msg = can.Message(arbitration_id=can_id, data=data, is_extended_id=False)
+            bus.send(msg)
+        except Exception as e:
+            rospy.logwarn(f"Encoder query error J{joint_idx+1}: {e}")
+        joint_idx = (joint_idx + 1) % 6
+        rate.sleep()
 
 
 # ── FOLLOW JOINT TRAJECTORY ACTION SERVER ─────────────────────────────────────
@@ -327,6 +385,10 @@ class TrajectoryActionServer:
     when available (requires joint_limits.yaml to be populated so
     MoveIt/TOTG fills point.velocities). Falls back to F5_SPEED
     when velocity data is absent.
+
+    A proportional (P) correction term is added to the feedforward
+    velocity command based on the error between the planned position
+    and the actual encoder position, read back asynchronously.
     """
 
     def __init__(self):
@@ -453,6 +515,10 @@ class TrajectoryActionServer:
         the trajectory's own velocity profile via the gear ratio. Falls
         back to the global F5_SPEED constant when velocities is None.
 
+        A P term correction is added on top of the feedforward RPM using
+        the error between the planned position and the actual encoder
+        position read back asynchronously by can_listener_loop.
+
         Also updates last_sent_angles so that any subsequent settle-detect
         moves use the correct baseline.
         """
@@ -470,20 +536,30 @@ class TrajectoryActionServer:
         # Apply differential mix for J5/J6 (positions and velocities)
         mixed_pos = apply_differential_mix(joint_angles)
         mixed_vel = apply_differential_mix(joint_vels)
-        #rospy.loginfo(f"mixed_pos J5={mixed_pos[4]:.4f} J6={mixed_pos[5]:.4f}  "
-        #      f"raw j5={joint_angles[4]:.4f} j6={joint_angles[5]:.4f}")
-
-        # Send F5 to each motor
         rpm_floor = rospy.get_param('/arctos/rpm_floor', F5_RPM_MIN)
+        # Send F5 to each motor
         for motor_idx in range(6):
             target_counts = rad_to_encoder_counts(motor_idx, mixed_pos[motor_idx])
-            # Only use dynamic RPM if we have velocity data AND it's meaningful 
+
+            # Feedforward RPM from trajectory velocity profile
             if velocities is not None and mixed_vel[motor_idx] > 0.001:
-                rpm = rad_s_to_rpm(motor_idx, mixed_vel[motor_idx])
+                base_rpm = rad_s_to_rpm(motor_idx, mixed_vel[motor_idx])
             elif velocities is not None and mixed_vel[motor_idx] <= 0.001:
-                rpm = rpm_floor
+                base_rpm = rpm_floor
             else:
-                rpm = F5_SPEED  # only true fallback when no velocity data at all
+                base_rpm = F5_SPEED  # only true fallback when no velocity data at all
+
+            # P term: corrective velocity from position error.
+            # error > 0 means we are behind the planned position — speed up.
+            # error < 0 means we are ahead — slow down.
+            # correction_rad_s has units of rad/s (Kp is in 1/s).
+            error = mixed_pos[motor_idx] - encoder_feedback_rad[motor_idx]
+            correction_rad_s = Kp * error
+            correction_rpm = rad_s_to_rpm(motor_idx, correction_rad_s)
+            if error < 0:
+                correction_rpm = -correction_rpm
+
+            rpm = int(max(rpm_floor, min(base_rpm + correction_rpm, F5_RPM_MAX)))
             send_f5(motor_idx, target_counts, speed=rpm)
             abs_positions[motor_idx] = target_counts
 
@@ -605,6 +681,7 @@ def main():
     rospy.loginfo(f"  F5 acc      : {F5_ACC}")
     rospy.loginfo(f"  F4 speed    : {F4_SPEED} RPM")
     rospy.loginfo(f"  Stream rate : {STREAM_RATE_HZ} Hz")
+    rospy.loginfo(f"  P gain (Kp) : {Kp} (set to 0 to disable feedback correction)")
     rospy.loginfo("=" * 60)
 
     try:
@@ -623,7 +700,12 @@ def main():
     for i in range(6):
         pos = query_encoder_position(i)
         abs_positions[i] = pos
-        rospy.loginfo(f"  J{i+1} (ID {CAN_IDS[i]}): encoder = {pos}")
+        # Also seed the feedback array from the startup query
+        angle_rad = math.radians(pos / (ENCODER_CPR * GEAR_RATIOS[i]) * 360.0)
+        if INVERT_DIRECTION[i]:
+            angle_rad = -angle_rad
+        encoder_feedback_rad[i] = angle_rad
+        rospy.loginfo(f"  J{i+1} (ID {CAN_IDS[i]}): encoder = {pos}, angle = {math.degrees(angle_rad):.2f} deg")
 
     # Publishers
     move_complete_pub = rospy.Publisher(
@@ -645,6 +727,10 @@ def main():
     listener = threading.Thread(target=can_listener_loop, daemon=True)
     listener.start()
 
+    # Start encoder query broadcaster thread
+    querier = threading.Thread(target=encoder_query_loop, daemon=True)
+    querier.start()
+
     # Start settle-detect sender (only active when action server is idle)
     sender = threading.Thread(target=settle_sender_loop, daemon=True)
     sender.start()
@@ -652,6 +738,7 @@ def main():
     rospy.loginfo("Ready.")
     rospy.loginfo("  Action server: /arm_controller/follow_joint_trajectory")
     rospy.loginfo("  GUI fallback:  /move_group/fake_controller_joint_states")
+    rospy.loginfo("  Encoder query: running (async, round-robin)")
 
     rospy.spin()
     bus.shutdown()
