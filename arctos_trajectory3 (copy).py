@@ -92,15 +92,7 @@ def make_pose(x, y, z, qx, qy, qz, qw):
     p.orientation.w = qw
     return p
 
-from moveit_msgs.msg import RobotState
-from sensor_msgs.msg import JointState as SensorJointState
 
-def set_start_state_from_current(group, robot):
-    """Force the planner to start from the real current state."""
-    current = robot.get_current_state()
-    group.set_start_state(current)
-    
-    
 def execute_via_action_server(client, robot, group, plan):
     """
     Send a MoveIt plan to the FollowJointTrajectory action server.
@@ -185,16 +177,13 @@ def run_trajectory():
     oc.orientation.w = 1.0
     oc.absolute_x_axis_tolerance = 0.05  # tighten as needed
     oc.absolute_y_axis_tolerance = 0.05
-    oc.absolute_z_axis_tolerance = 0.005
+    oc.absolute_z_axis_tolerance = 0.05
     oc.weight = 1.0
     
     constraints = Constraints()
     constraints.orientation_constraints.append(oc)
     group.set_path_constraints(constraints)
-    
-    group.set_start_state_to_current_state()
-    
-    (plan, fraction) = group.compute_cartesian_path(poses, CARTESIAN_STEP, False)
+    (plan, fraction) = group.compute_cartesian_path(poses, CARTESIAN_STEP, True)
     group.clear_path_constraints()  # always clear after
 
     

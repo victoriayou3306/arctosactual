@@ -56,11 +56,10 @@ F5_ACC   = 200
 F5_RPM_MIN = 20   # floor — prevents stall on near-zero velocity segments
 F5_RPM_MAX = 500  # ceiling — keep within safe motor limits
 
-Kp = [0.3, 0.01, 0.01, 0.22, 0.22, 0.22]
+Kp = [0.4, 0.01, 0.01, 0.22, 0.22, 0.22]
 #Kp = 0.005
 
-Kd = 0.0
-
+Kd = [0.8,0.3,0.3,0.3,0.3,0.3]
 encoder_feedback_rad = [0.0] * 6
 
 encoder_feedback_vel_rad_s = [0.0] * 6
@@ -606,7 +605,7 @@ class TrajectoryActionServer:
             # correction_rad_s has units of rad/s (Kp is in 1/s).
             error = mixed_pos[motor_idx] - encoder_feedback_rad[motor_idx]
             meas_vel = encoder_feedback_vel_rad_s[motor_idx]
-            correction_rad_s = (Kp[motor_idx]) * error - Kd * meas_vel
+            correction_rad_s = (Kp[motor_idx]) * error - (Kd[motor_idx]) * meas_vel
             
             correction_rpm = int(correction_rad_s * GEAR_RATIOS[motor_idx] * 60.0 / (2.0 * math.pi))
             rpm = int(max(F5_RPM_MIN, min(base_rpm + correction_rpm, F5_RPM_MAX)))
@@ -628,7 +627,7 @@ class TrajectoryActionServer:
                         break
                 if traj_idx_for_motor is not None and traj_idx_for_motor < len(planned_vel_est):
                     pvel = planned_vel_est[traj_idx_for_motor]
-                    d_correction_rpm = rad_s_to_rpm(motor_idx, Kd * pvel)
+                    d_correction_rpm = rad_s_to_rpm(motor_idx, (Kd[motor_idx]) * pvel)
                     if pvel < 0:
                         d_correction_rpm = -d_correction_rpm
 
